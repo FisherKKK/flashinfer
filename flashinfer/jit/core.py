@@ -16,7 +16,8 @@ from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
-os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
+# Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
+# which may be read-only after installation
 
 
 class MissingJITCacheError(RuntimeError):
@@ -131,6 +132,7 @@ sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_fl
 sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
+sm120f_nvcc_flags = ["-gencode=arch=compute_120f,code=sm_120f"] + common_nvcc_flags
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
 
 current_compilation_context = CompilationContext()
@@ -416,9 +418,19 @@ def gen_jit_spec(
     verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
     debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
-    cflags = ["-std=c++17", "-Wno-switch-bool"]
+    # Only add default C++ standard if not specified in extra flags
+    cflags_has_std = extra_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cflags
+    )
+    cuda_cflags_has_std = extra_cuda_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cuda_cflags
+    )
+
+    cflags = ["-Wno-switch-bool"]
+    if not cflags_has_std:
+        cflags.insert(0, "-std=c++17")
+
     cuda_cflags = [
-        "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
@@ -426,6 +438,9 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if not cuda_cflags_has_std:
+        cuda_cflags.insert(0, "-std=c++17")
+
     if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
@@ -441,7 +456,7 @@ def gen_jit_spec(
         cuda_cflags += ["-DNDEBUG", "-O3"]
         cflags += ["-O3"]
 
-    # useful for ncu
+    # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
         cuda_cflags += ["-lineinfo"]
 

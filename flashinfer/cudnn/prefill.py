@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.attention import cudnn_batch_prefill_trace
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -185,15 +186,17 @@ if CUDNN_AVAILABLE:
             # Create tensors from the input tensors
             if q.dim() == 3:
                 h_qo, d_qk = q.shape[1], q.shape[2]
+                s_stride, h_stride, d_stride = q.stride()
             elif q.dim() == 4:
                 h_qo, d_qk = q.shape[2], q.shape[3]
+                s_stride, h_stride, d_stride = q.stride()
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
-                stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
+                stride=(h_qo * d_qk, h_stride, s_stride, d_stride),
                 data_type=cudnn_q_data_type,
             )
 
@@ -269,10 +272,11 @@ if CUDNN_AVAILABLE:
                 raise ValueError(f"Invalid kv cache tensor shape: {k_cache.shape}")
 
             if k_cache.dim() == 3:
+                s_stride, h_stride, d_stride = k_cache.stride()
                 cudnn_k_cache = g.tensor(
                     name="k_cache",
                     dim=(graph_b, h_kv, graph_s_kv, d_qk),
-                    stride=(h_kv * d_qk * graph_s_kv, d_qk, d_qk * h_kv, 1),
+                    stride=(h_kv * d_qk * graph_s_kv, h_stride, s_stride, d_stride),
                     data_type=cudnn_k_data_type,
                 )
 
@@ -281,10 +285,14 @@ if CUDNN_AVAILABLE:
                     ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
                     cudnn_k_cache.set_ragged_offset(ragged_k)
 
+                assert v_cache.dim() == 3, (
+                    "v_cache must have 3 dimensions since k_cache has 3 dimensions"
+                )
+                s_stride, h_stride, d_stride = v_cache.stride()
                 cudnn_v_cache = g.tensor(
                     name="v_cache",
                     dim=(graph_b, h_kv, graph_s_kv, d_vo),
-                    stride=(h_kv * d_vo * graph_s_kv, d_vo, d_vo * h_kv, 1),
+                    stride=(h_kv * d_vo * graph_s_kv, h_stride, s_stride, d_stride),
                     data_type=cudnn_v_data_type,
                 )
 
@@ -551,7 +559,7 @@ def _batch_prefill_with_kv_cache(
         return out, None
 
 
-@flashinfer_api
+@flashinfer_api(trace=cudnn_batch_prefill_trace)
 def cudnn_batch_prefill_with_kv_cache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

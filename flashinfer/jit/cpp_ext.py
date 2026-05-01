@@ -1,6 +1,7 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
 import functools
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,8 @@ import torch
 from . import env as jit_env
 from ..compilation_context import CompilationContext
 
+logger = logging.getLogger(__name__)
+
 
 def parse_env_flags(env_var_name) -> List[str]:
     env_flags = os.environ.get(env_var_name)
@@ -25,9 +28,10 @@ def parse_env_flags(env_var_name) -> List[str]:
 
             return shlex.split(env_flags)
         except ValueError as e:
-            print(
-                f"Warning: Could not parse {env_var_name} with shlex: {e}. Falling back to simple split.",
-                file=sys.stderr,
+            logger.warning(
+                "Could not parse %s with shlex: %s. Falling back to simple split.",
+                env_var_name,
+                e,
             )
             return env_flags.split()
     return []
@@ -91,12 +95,16 @@ def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
 
+def get_cccl_includes() -> List:
+    """Get vendored CCCL include directories (added with -I for CTK override precedence)."""
+    return [p.resolve() for p in jit_env.CCCL_INCLUDE_DIRS]
+
+
 def get_system_includes(cuda_home: str) -> List:
     """Get list of system include directories."""
     system_includes = [
         sysconfig.get_path("include"),
         "$cuda_home/include",
-        "$cuda_home/include/cccl",
         tvm_ffi.libinfo.find_include_path(),
         tvm_ffi.libinfo.find_dlpack_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
@@ -117,6 +125,7 @@ def build_common_cflags(
     extra_include_dirs: Optional[List[Path]] = None,
 ) -> List[str]:
     """Build common compilation flags."""
+    cccl_includes = get_cccl_includes()
     system_includes = get_system_includes(cuda_home)
 
     common_cflags = []
@@ -126,6 +135,11 @@ def build_common_cflags(
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
             common_cflags.append(f"-I{extra_dir.resolve()}")
+    # Vendored CCCL headers use -I (not -isystem) so they take precedence
+    # over the CTK-bundled copy. CCCL headers use #pragma system_header
+    # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
+    for cccl_dir in cccl_includes:
+        common_cflags.append(f"-I{cccl_dir}")
     for sys_dir in system_includes:
         common_cflags.append(f"-isystem {sys_dir}")
 
@@ -286,7 +300,7 @@ def generate_ninja_build_for_op(
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
-        obj_name = source.with_suffix(object_suffix).name
+        obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")

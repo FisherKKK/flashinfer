@@ -51,6 +51,8 @@ def run_norm_test(args):
         return testRmsnormFp4quant(args)
     elif args.routine == "add_rmsnorm_fp4quant":
         return testAddRmsnormFp4quant(args)
+    elif args.routine == "fused_rmsnorm_silu":
+        return testFusedRmsnormSilu(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -141,6 +143,13 @@ def parse_norm_args(line, parser):
         action="store_true",
         default=False,
         help="Use swizzled scale factor layout for tensor core GEMM. Default: False",
+    )
+    parser.add_argument(
+        "--output_both_sf_layouts",
+        action="store_true",
+        default=False,
+        help="Output both swizzled and unswizzled scale factors. When enabled, "
+        "overrides --is_sf_swizzled_layout and returns both layouts. Default: False",
     )
 
     args = parser.parse_args(line)
@@ -759,6 +768,8 @@ def testRmsnormFp4quant(args):
             f"for {out_dtype} quantization."
         )
 
+    enable_pdl = args.enable_pdl
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -794,10 +805,18 @@ def testRmsnormFp4quant(args):
         print(f"[VVERBOSE] {block_size = }")
         print(f"[VVERBOSE] {use_global_scale = }")
         print(f"[VVERBOSE] {is_sf_swizzled_layout = }")
+        print(f"[VVERBOSE] {enable_pdl = }")
 
     # Warn user that refcheck is not supported for FP4 quantization fusion
     if run_refcheck:
         print("[WARNING] --refcheck is not supported for rmsnorm_fp4quant.")
+
+    # Warn user that output_both_sf_layouts is not supported for rmsnorm_fp4quant
+    if args.output_both_sf_layouts:
+        print(
+            "[WARNING] --output_both_sf_layouts is not supported for rmsnorm_fp4quant. "
+            "Use add_rmsnorm_fp4quant instead. Flag will be ignored."
+        )
 
     def run_backend(backend, input_tensor, weight):
         if backend == "cute-dsl":
@@ -808,6 +827,7 @@ def testRmsnormFp4quant(args):
                 block_size=block_size,
                 global_scale=global_scale,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
+                enable_pdl=enable_pdl,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -873,7 +893,10 @@ def testAddRmsnormFp4quant(args):
 
     This test:
     1. Generates random input and residual tensors
-    2. Runs add_rmsnorm_fp4quant (h = input + residual, then RMSNorm with FP4 quantized output)
+    2. Runs add_rmsnorm_fp4quant:
+       - residual is updated in-place: residual = input + residual
+       - RMSNorm is computed on the updated residual
+       - Output is FP4 quantized
     3. Runs reference check
     4. Measures performance metrics (memory bandwidth)
 
@@ -909,6 +932,8 @@ def testAddRmsnormFp4quant(args):
     out_dtype = args.out_dtype
     use_global_scale = args.use_global_scale
     is_sf_swizzled_layout = args.is_sf_swizzled_layout
+    output_both_sf_layouts = args.output_both_sf_layouts
+    enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -973,6 +998,7 @@ def testAddRmsnormFp4quant(args):
         print(f"[VVERBOSE] {block_size = }")
         print(f"[VVERBOSE] {use_global_scale = }")
         print(f"[VVERBOSE] {is_sf_swizzled_layout = }")
+        print(f"[VVERBOSE] {output_both_sf_layouts = }")
 
     # Warn user that refcheck is not supported for FP4 quantization fusion
     if run_refcheck:
@@ -988,6 +1014,8 @@ def testAddRmsnormFp4quant(args):
                 block_size=block_size,
                 global_scale=global_scale,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
+                output_both_sf_layouts=output_both_sf_layouts,
+                enable_pdl=enable_pdl,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1011,18 +1039,22 @@ def testAddRmsnormFp4quant(args):
 
             # Memory bandwidth calculation for Add + RMSNorm + FP4 Quant
             # Read: input tensor + residual tensor + weight tensor
-            # Write: FP4 output + scale factors + h tensor (residual updated)
+            # Write: residual tensor (in-place update with input + residual) + FP4 output + scale factors
             num_elements = np.prod(input_shape)
             num_scale_elements = num_elements // block_size
             # FP4: 2 elements per byte (4 bits each)
             fp4_output_bytes = num_elements // 2
+            # Scale factors: 1 byte each. When output_both_sf_layouts=True, write 2x scale factors
+            sf_write_multiplier = 2 if output_both_sf_layouts else 1
             problem_bytes = (
                 num_elements * input_dtype.itemsize  # input read
                 + num_elements * input_dtype.itemsize  # residual read
                 + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements
+                * input_dtype.itemsize  # residual write (in-place: input + residual)
                 + fp4_output_bytes  # FP4 output write
-                + num_scale_elements  # scale factors write (1 byte each)
-                + num_elements * input_dtype.itemsize  # h output write
+                + num_scale_elements
+                * sf_write_multiplier  # scale factors write (1 byte each)
             )
             problem_flops = num_elements * 6  # rough estimate (add + rmsnorm ops)
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
@@ -1043,7 +1075,127 @@ def testAddRmsnormFp4quant(args):
                 cur_res["eps"] = eps
                 cur_res["use_global_scale"] = use_global_scale
                 cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
+                cur_res["output_both_sf_layouts"] = output_both_sf_layouts
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
+    return res
+
+
+def testFusedRmsnormSilu(args):
+    """
+    Test fused_rmsnorm_silu API (RMSNorm + SiLU activation).
+
+    This test:
+    1. Generates random input tensors
+    2. Runs fused_rmsnorm_silu with bf16 output
+    3. Optionally runs reference check
+    4. Measures performance metrics (memory bandwidth)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testFusedRmsnormSilu")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    eps = args.eps
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"fused_rmsnorm_silu requires bfloat16 input, got {args.input_dtype}"
+        )
+
+    input_shape = (batch_size, hidden_size)
+    input_tensor = torch.randn(input_shape, dtype=torch.bfloat16, device=device)
+    weight = torch.rand(hidden_size, dtype=torch.bfloat16, device=device) * 1.5 + 0.5
+    out = torch.empty(input_shape, dtype=torch.bfloat16, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+
+    def run_fn(input_tensor, weight, out):
+        return flashinfer.fused_rmsnorm_silu(input_tensor, weight, eps=eps, out=out)
+
+    has_reference_output = False
+    if run_refcheck:
+        rms = torch.sqrt(
+            torch.mean(input_tensor.float() ** 2, dim=-1, keepdim=True) + eps
+        )
+        x_norm = input_tensor.float() / rms * weight.float()
+        reference_output = torch.nn.functional.silu(x_norm).to(torch.bfloat16)
+        has_reference_output = True
+
+    if run_refcheck:
+        test_out = run_fn(input_tensor, weight, out)
+        if has_reference_output:
+            (
+                num_different_elements,
+                num_elements,
+                num_different_elements_percentage,
+            ) = is_close_stats(reference_output, test_out, rtol=2e-2, atol=2e-2)
+            if num_different_elements > 0:
+                print(
+                    f"[ERROR] Output tensor mismatch: "
+                    f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Output mismatch with {num_different_elements} elements"
+                    )
+
+    times = bench_gpu_time(
+        fn=run_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_tensor, weight, out),
+    )
+
+    if len(times) > 0:
+        median_time = np.median(times)
+        std_time = np.std(times)
+
+        num_elements = np.prod(input_shape)
+        problem_bytes = (
+            num_elements * input_dtype.itemsize  # input read
+            + hidden_size * input_dtype.itemsize  # weight read
+            + num_elements * input_dtype.itemsize  # output write
+        )
+        problem_flops = num_elements * 7  # rmsnorm (5) + silu (2: exp + div)
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+
+        print_perf_metrics("cuda", median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["input_dtype"] = str(input_dtype)
+            cur_res["eps"] = eps
+            cur_res["backend"] = "cuda"
+            cur_res["case_tag"] = args.case_tag
+            res.append(cur_res)
     return res
